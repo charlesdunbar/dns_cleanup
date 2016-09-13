@@ -12,6 +12,7 @@ import argparse
 import dns.query
 import dns.zone
 import subprocess
+import sys
 import threading
 
 # Parse args
@@ -20,6 +21,9 @@ parser.add_argument("zone", help="the zone to purge stale ddns records", type=st
 parser.add_argument("dns_server",  help="DNS server to use to resolve a domain", type=str)
 parser.add_argument("-f", "--filename",  help="file output destination - default is /tmp/{zone}.ns", metavar='')
 parser.add_argument("-v", "--verbose",  help="increase verbosity", action="store_true")
+parser.add_argument("-d", "--ddns",  help="serach for A and TXT records - usually indicates dynamic dns in use", action="store_true")
+parser.add_argument("-n", "--noop",  help="only display potenial hosts, don't ping or update file", action="store_true")
+parser.add_argument("-x", "--dup",  help="display entries that have multiple A records for one IP", action="store_true")
 parser.add_argument("-w", "--workers",  help="number of worker threads used in pinging (default 4)", default=4, type=int, metavar='')
 args = parser.parse_args()
 
@@ -28,6 +32,7 @@ if args.filename is None: args.filename = "/tmp/{0}.ns".format(args.zone)
 
 suspect_list = []
 dead_list = []
+dup_list = {}
 
 # Pinger class found from http://blog.boa.nu/2012/10/python-threading-example-creating-pingerpy.html
 # Slight modifications used to match what I'm doing
@@ -39,14 +44,15 @@ class Pinger(object):
 
     def ping(self, host):
         # Use the system ping command with count of 2 and wait time of 1.
-	p = subprocess.Popen(["ping", host[0].to_text() + "." + args.zone, "-c", "2", "-W", "1"], stdout=subprocess.PIPE)
-	output = p.communicate()[0]
-	if args.verbose: print output
-	if p.returncode != 0:
-	    if args.verbose: print "Host appears down, adding to list to be removed"
-	    dead_list.append(host)
-	else:
-	    if args.verbose: print "Host appears up"
+        p = subprocess.Popen(["ping", "-c", "2", "-W", "1", host[0].to_text() + "." + args.zone], stdout=subprocess.PIPE)
+        if args.verbose: print "Trying to run `ping -c2 -W1 {0}.{1} `".format(host[0].to_text(),args.zone)
+        output = p.communicate()[0]
+        if args.verbose: print output
+        if p.returncode != 0:
+            if args.verbose: print "Host appears down, adding to list to be removed"
+            dead_list.append(host)
+        else:
+            if args.verbose: print "Host appears up"
 
     def pop_queue(self):
         host = None
@@ -58,7 +64,7 @@ class Pinger(object):
 
         self.lock.release() # Release the lock, so another thread could grab it.
 
-        return host 
+        return host
 
     def dequeue(self):
         while True:
@@ -67,7 +73,7 @@ class Pinger(object):
             if not host:
                 return None
 
-            self.ping(host) 
+            self.ping(host)
 
     def start(self):
         threads = []
@@ -85,17 +91,35 @@ class Pinger(object):
 
 def get_suspects():
     try:
-	if args.verbose: print "Transfering {0} from DNS server 10.240.0.10\n".format(args.zone)
-	zone = dns.zone.from_xfr(dns.query.xfr(args.dns_server, args.zone))
-	for i in zone.nodes.items():
-	    # If a record has 2 types, check if one's A and one is TXT
-	    # Append to list if they are
-	    if len(i[1].rdatasets) == 2:
-		if i[1].rdatasets[0].rdtype == dns.rdatatype.TXT and i[1].rdatasets[1].rdtype == dns.rdatatype.A or \
-		    i[1].rdatasets[1].rdtype == dns.rdatatype.TXT and i[1].rdatasets[0].rdtype == dns.rdatatype.A:
-		    suspect_list.append(i)
+        if args.verbose: print "Transfering {0} from DNS server {1}\n".format(args.zone, args.dns_server)
+        zone = dns.zone.from_xfr(dns.query.xfr(args.dns_server, args.zone))
+        for i in zone.nodes.items():
+            # If a record has 2 types, check if one's A and one is TXT
+            # Append to list if they are
+            if args.ddns:
+                if len(i[1].rdatasets) == 2:
+                    if i[1].rdatasets[0].rdtype == dns.rdatatype.TXT and i[1].rdatasets[1].rdtype == dns.rdatatype.A or \
+                    i[1].rdatasets[1].rdtype == dns.rdatatype.TXT and i[1].rdatasets[0].rdtype == dns.rdatatype.A:
+                        suspect_list.append(i)
+            else:
+                if args.dup:
+                    for records in i[1]:
+                        if records.rdtype == dns.rdatatype.A:
+                            suspect_list.append(i)
+                else:
+                    for records in i[1]:
+                        if records.rdtype == dns.rdatatype.A:
+                            suspect_list.append(i)
+
     except Exception as e:
-	print e
+        print e
+
+def find_dups():
+    for i in suspect_list:
+        ip = i[1].rdatasets[0].items[0].to_text()
+        dup_list.setdefault(ip, [])
+        dup_list[ip].append(i[0].to_text() + '.' + args.zone)
+
 
 def ping_suspects():
     # Add whitespace
@@ -107,7 +131,7 @@ def ping_suspects():
 
 
 def save_to_file(filename):
-    try:	
+    try:
 	open_file = str(filename) + ".0"
 	f = open(open_file, 'wb')
 	for i, record in enumerate(dead_list):
@@ -123,21 +147,34 @@ def save_to_file(filename):
 	f.close()
 
 if __name__ == "__main__":
-    print "Finding records in zone {0} with both an A and TXT record".format(args.zone)
+    if args.ddns:
+        print "Finding records in zone {0} with both an A and TXT record".format(args.zone)
+    else:
+        print "Finding A records in zone {0}".format(args.zone)
     get_suspects()
+    if args.dup:
+        print "The IPs with multiple records are:"
+        find_dups()
+        for i in dup_list:
+            if len(dup_list[i]) > 1:
+                print "IP {0} has multiple records: {1}".format(i, ', '.join(dup_list[i]))
+        sys.exit()
     if args.verbose:
-	print "The {0} suspected records with both A and TXT records are:".format(len(suspect_list))
+        if args.ddns:
+            print "The {0} suspected records with both A and TXT records are:".format(len(suspect_list))
+        else:
+            print "The {0} suspected records with an A records are:".format(len(suspect_list))
 	for i in suspect_list:
 	    print i[0].to_text()
     print "{0} suspected records".format(len(suspect_list))
+    if args.noop: sys.exit()
     if len(suspect_list) > 0:
 	ping_suspects()
     if args.verbose:
 	print "The {0} records that don't reply to ping are:".format(len(dead_list))
 	for i in dead_list:
-	    print i[0].to_text() 
+	    print i[0].to_text()
     print "{0} dead records found".format(len(dead_list))
     if len(dead_list) > 0:
 	save_to_file(args.filename)
 	print "Wrote file to {0} - check the output and run nsupdate on {0}.*`".format(args.filename)
-    
